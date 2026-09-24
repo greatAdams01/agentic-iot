@@ -1,192 +1,244 @@
-# Week 1 schema, semantics and acceptance notes
+# Understanding Week 1
 
-This is the implementation record for the existing timeline, not a replacement
-research specification. The supplied Implementation Specification v1 is the
-technical authority. Its referenced Formal Models v1/v2 were not available among
-the supplied documents; the choices below make otherwise implicit behavior
-explicit and testable pending comparison with those models.
+We built the part of our system that answers:
 
-## Public data and interfaces
+> “Do we currently have enough usable evidence to support this conclusion, and why?”
 
-All safety times are `std::time::Duration` from the virtual clock's zero, with
-nanosecond precision. Horizons are exclusive: support is valid only at `now <
-horizon`. Wall-clock labels are not collected in this deterministic kernel;
-a future host adapter may attach them for human logs, never for expiry decisions.
+Imagine a building with three sensors and a ventilation fan. We want the system
+to confirm a hazard when at least two sensors report it. We also want it to stop
+relying on old readings, explain its answers, and record changes.
 
-| Type | Fields / invariant |
+Week 1 implements those checks in software. It does not connect to real sensors,
+control the fan, or use AI yet. The examples provide simulated observations.
+
+## 1. Evidence: information the system can use
+
+An **evidence record** represents an observation about a particular condition.
+For example: “Sensor S1 reports that the gas level is high.”
+
+In our code, this record is an `EvidenceAtom`. Its fields answer ordinary questions:
+
+| Field | What it tells us | Example |
+| --- | --- | --- |
+| `evidence_id` | Which piece of evidence is this? | `s1.gas_high` |
+| `evidence_type` | What kind of evidence is it? | `sensor` |
+| `predicate` | What condition are we checking? | `gas_high` |
+| `source_id` | Where did the observation come from? | `s1` |
+| `version` | Which update is this for that evidence ID? | `10` |
+| `observed_at` | When was the observation made? | 0 seconds |
+| `expires_at` | When does its valid support end? | 2 seconds |
+| `status` | Does it support the condition? | `Valid` |
+| `payload_hash` | Optional identifier derived from the original data | Not used in our demo |
+
+The current kernel receives the status as input. It does not turn a raw gas
+reading into a trustworthy claim by itself. That needs domain-specific rules
+and sensor validation later. A payload hash alone does not prove a reading is true.
+
+## 2. Why we have three statuses
+
+`AssuranceStatus` is the one enum we use for these three possibilities:
+
+| Status | Plain meaning |
 | --- | --- |
-| `AssuranceStatus` | `Valid`, `Unknown`, `Invalid`; no Boolean conversion |
-| `AssuranceValue` | `Valid { horizon }`, `Unknown`, `Invalid`; the latter two cannot carry a horizon |
-| `EvidenceAtom` | `evidence_id`, `evidence_type`, `predicate`, `source_id`, `version: u64`, `observed_at`, `expires_at`, `status`, optional `payload_hash` |
-| `Node` | `node_id`, `kind` |
-| `NodeKind` | Evidence, Derived, ActionStart, ActionRun, ActionCommit, ActionOutcome, PhysicalSafety |
-| `Justification` | `justification_id`, distinct `premises`, `threshold`, `conclusion` |
-| `Witness` | `node_id`, deduplicated ordered `evidence_ids`, `horizon`, selected `justification_id`, selected `premise_ids` |
-| `Evaluation` | `assurance_by_node`, `assurance_by_justification`, `preferred_witness_by_node` |
-| `AuditEntry` | Monotonic `at`, assurance `epoch`, typed `event` |
+| `Valid` | The available evidence supports the condition. |
+| `Invalid` | Under our rules, the condition is not satisfied. |
+| `Unknown` | We lack enough usable information to decide. |
 
-Action phase kinds are distinct graph roots, not action state machines. A valid
-start root is an assurance result, not a durable lease or permission to dispatch.
+A sensor reporting “gas is not high” may provide an `Invalid` status for the
+condition `gas_high`. A missing or expired reading is `Unknown` instead.
 
-`AssuranceGraph::new(nodes, justifications)` validates configuration and returns
-an immutable graph or `GraphError`. Read-only accessors expose rules (including
-premises by justification), rules by premise, rules by conclusion, and the
-stable topological order. No lease index is instantiated before leases exist.
+**Valid does not mean safe.** If the condition is “a hazard exists,” a valid
+result means the evidence supports the existence of a hazard.
 
-`evaluate_full(&graph, &evidence_map, now)` returns a new `Evaluation`, visiting
-every node and every justification. It is a pure snapshot evaluator, not an
-event processor. The runtime supplies validated atoms keyed by their ID. Missing
-or mismatched map identities fail closed to unknown; extra map entries are ignored.
-Standalone callers are responsible for metadata validation. Runtime clients
-should read `runtime.evaluation()` rather than bypass the lifecycle.
+## 3. Rules: how we combine evidence
 
-`AssuranceRuntime::new(graph)` starts at time/epoch zero with all observations
-missing and a fully evaluated unknown graph. Its graph, evidence, evaluation,
-audit and time are exposed read-only. `update(atom)` accepts one observation;
-`advance(elapsed)` and `advance_to(target)` process time and due expiry events.
-All three operations return typed errors for rejected input.
+The specification calls each rule a **justification**. It has inputs
+(`premises`), a required count (`threshold`), and an output (`conclusion`).
 
-## Configuration mapping (specification section 32)
+| Rule | Meaning | Example |
+| --- | --- | --- |
+| AND | Every input is required | Hazard confirmed AND fan healthy |
+| OR | At least one input is required | Either of two alternative sources supports a condition |
+| 2-of-3 | Any two of three inputs are required | Two sensors support hazard confirmation |
 
-Week 1 exposes typed Rust configuration and documents the mapping below. It does
-not include a JSON parser, network protocol or source authentication layer.
+For a 2-of-3 rule:
 
-```json
-{
-  "id": "zone2.gas_sensor_1.high",
-  "type": "sensor",
-  "predicate": "gas_high",
-  "source": "gas_sensor_1",
-  "max_age_ms": 2000
-}
+- Two valid sensors and one unknown sensor: **Valid**. We already have enough.
+- One valid, one unknown and one invalid: **Unknown**. The unknown could make the difference.
+- One valid and two invalid: **Invalid**. We cannot reach the required two.
+
+The code can use any valid required count, not just two out of three.
+
+## 4. The graph: connecting rules together
+
+A **graph** is our collection of evidence and conclusions, connected by rules.
+A **node** is one item in that graph.
+
+```text
+S1, S2, thermal sensor
+        │
+        │ at least two must support the hazard
+        ▼
+Hazard confirmed ───┐
+                    │ both required
+Fan healthy ────────┘
+                    ▼
+       Fan start conditions satisfied
 ```
 
-Create an Evidence node using `id`; observations map `id/type/source` to
-`evidence_id/evidence_type/source_id`. A future ingestion adapter computes
-`expires_at = observed_at + max_age_ms` with checked arithmetic. Runtime atoms
-already carry the resulting absolute deadline; raw readings may be stored
-outside the kernel. Status is supplied by the domain-specific observation
-validator, not inferred from a label or payload hash.
+The evaluator checks the sensor evidence before the hazard conclusion, then
+checks the fan's start conditions. This dependency-first order is called
+**topological order**.
 
-```json
-{
-  "id": "zone2.hazard_quorum",
-  "premises": ["zone2.gas_sensor_1.high", "zone2.gas_sensor_2.high", "zone2.thermal.high"],
-  "threshold": 2,
-  "conclusion": "zone2.hazard_confirmed"
-}
+We reject circular reasoning such as “A is supported by B, and B is supported
+by A.” We also reject broken configurations, such as a rule naming a sensor
+that was never declared or requiring four inputs when it only has three.
+
+A declared sensor with no reading is different: the graph is valid, but that
+sensor's evidence is unknown.
+
+The fan-start result is only a conclusion about its configured requirements.
+Week 1 does not execute the fan command.
+
+## 5. Witness: the explanation behind a valid answer
+
+A **witness** is the selected set of evidence supporting a conclusion.
+
+Suppose all three sensors support the hazard, but only two are required. The
+system might explain:
+
+> “Hazard confirmed, supported by S1 and S2.”
+
+If S2 becomes unknown, it can select S1 and the thermal sensor instead.
+The conclusion stays valid because another supporting pair exists.
+
+When several choices work, the system uses consistent selection rules so
+repeating the same experiment gives the same explanation.
+
+## 6. Horizon: when that support expires
+
+A **horizon** is a deadline, not a duration measured from the current moment.
+
+Suppose three valid observations expire at these simulated times:
+
+| Sensor | Expiry time |
+| --- | --- |
+| S1 | 5 seconds |
+| S2 | 8 seconds |
+| Thermal | 12 seconds |
+
+For a 2-of-3 rule, the system selects S2 and Thermal. That pair supports the
+conclusion until **8 seconds**, when the first member of the pair expires.
+At exactly 8 seconds, that pair is no longer usable and the conclusion must be checked again.
+
+This is why we keep two related types:
+
+- `AssuranceStatus`: just Valid, Unknown or Invalid.
+- `AssuranceValue`: the result, including a horizon when it is Valid.
+
+A later observation can change the answer before the horizon. The horizon is
+not a promise that nothing will change or that a physical action is safe.
+
+## 7. Time, versions and epochs are different things
+
+| Term | What it tracks |
+| --- | --- |
+| Simulated time (`t`) | How far we have advanced the experiment's clock |
+| Evidence version | Which observation update we have for one evidence ID |
+| Epoch | How many evidence updates and expiry events the runtime has accepted or processed |
+
+The program starts at time zero. We advance time explicitly; we do not wait
+for real seconds to pass. This makes experiments repeatable.
+
+Three sensor updates can all arrive at simulated time zero. We then have
+`t=0`, but `epoch=3`. Time has not moved; three updates have happened.
+
+An observation's version changes when a newer observation arrives. Its version
+does not change just because it becomes too old to use.
+
+## 8. What happens when evidence expires
+
+Consider version 10 of an observation, received at time zero and expiring at 2 seconds:
+
+```text
+Time 0: accept version 10 → Valid, horizon 2 seconds, epoch 1
+Time 2: process expiry    → Unknown, version still 10, epoch 2
+Time 3: inspect result   → still Unknown; no new event
 ```
 
-Declare the three Evidence nodes and a Derived conclusion. Map this rule's `id`
-to `justification_id`; the remaining fields map directly. All node references
-must exist. Empty IDs, duplicate node/rule IDs, duplicate premises, zero or
-oversized thresholds, rules concluding at Evidence nodes, derived nodes without
-justifications, self-cycles and multi-node cycles are rejected. An empty graph
-and evidence-only graphs are valid. A configured sensor with no observation is
-unknown; a reference to an unconfigured sensor is a configuration error.
+Even if we jump the simulated clock directly from 0 to 3 seconds, the runtime
+processes the expiry at its deadline of 2 seconds.
 
-## Evaluation and witness semantics
+It records an `EvidenceExpired` event and reevaluates the conclusions. It does
+not need a new sensor message to notice that the existing evidence is stale.
 
-The implemented threshold truth rule is strong three-valued logic. For threshold
-k, let v be valid premises and u be unknown premises:
+A fresh observation can restore support. A replacement observation also replaces
+the old deadline, so the old deadline cannot incorrectly expire the new reading.
 
-- VALID if v >= k.
-- INVALID if v + u < k: even resolving every unknown positively cannot meet k.
-- UNKNOWN otherwise.
+## 9. The audit log: a diary of changes
 
-This is an explicit implementation assumption where the supplied specification
-requires three values but does not spell out the whole truth table. INVALID
-means the predicate lacks the required support under this logic; it does not
-mean that the physical situation is undesirable. UNKNOWN is never treated as VALID.
+The runtime keeps a history that explains what changed:
 
-| A | B | AND | OR |
-| --- | --- | --- | --- |
-| VALID | VALID | VALID | VALID |
-| VALID | UNKNOWN | UNKNOWN | VALID |
-| VALID | INVALID | INVALID | VALID |
-| UNKNOWN | UNKNOWN | UNKNOWN | UNKNOWN |
-| UNKNOWN | INVALID | INVALID | UNKNOWN |
-| INVALID | INVALID | INVALID | INVALID |
-
-Rows are symmetric. AND uses k=n; OR uses k=1. Multiple justifications for one
-conclusion behave as OR: any valid rule suffices, otherwise any unknown rule
-makes the result unknown, otherwise it is invalid.
-
-Atomic valid witnesses contain one evidence ID and its expiry. For a threshold,
-choose k valid premise witnesses ordered by higher horizon, fewer evidence atoms,
-then lexicographically smaller premise node ID. The last criterion completes the
-specification's unspecified tie between premises. Union their leaf evidence IDs;
-the result's horizon is the minimum selected horizon. Shared leaves appear once.
-Thresholds count distinct configured premise nodes, not independent physical
-sensors: independence must be established by the model/configuration.
-
-Among alternative valid justifications, prefer higher horizon, then fewer atoms
-in the candidate union, then lexicographically smaller justification ID, as in
-section 16. This is deterministic local witness selection. It does not claim a
-globally minimum-cardinality leaf union across every possible tied combination.
-The Week 2 exhaustive oracle will check maximal horizons on tiny graphs.
-
-Hand-worked example: a 2-of-3 gate with horizons 5, 8, 12 chooses the latter two
-and has horizon 8. A downstream AND with another premise expiring at 6 has horizon
-6. A horizon is a limit on declared support, not a sensor-truth or physical-safety
-guarantee. Evidence version/provenance can be inspected through the runtime store
-and observation audit entries; witnesses are not version-bound leases.
-
-## Evidence lifecycle, epochs and audit
-
-The runtime rejects unknown/non-evidence IDs, blank source/type/predicate, future
-observations, expiry preceding observation, and non-increasing per-ID versions.
-Version zero is allowed initially. Once an ID is observed, its source/type/
-predicate identity is fixed for this runtime; changing that identity requires a
-new ID/configuration. These are explicit ingestion policies. Source clock
-translation and restart/version-reset handling belong to a later adapter.
-
-Accepted updates increment the epoch even when the status is unchanged, because
-new observation versions matter. `EvidenceUpdated` records the previous atom
-and the complete incoming atom. Rejected operations do not alter time, epochs,
-evidence, evaluation or audit history.
-
-A VALID atom expires at its deadline: increment the epoch, record
-`EvidenceExpired { evidence_id, version }`, and change its logical status to
-UNKNOWN without changing its version or observation timestamps. Original
-observation status remains available in `EvidenceUpdated`. UNKNOWN and INVALID
-observations do not generate expiry events. A new observation is needed to
-replace their state.
-
-Advancing across several deadlines processes them chronologically. At a shared
-deadline, all expiries are recorded in evidence-ID order before full reevaluation;
-each expiry has its own epoch and the resulting evaluation uses the final epoch
-of the group. This prevents conclusions from observing partially processed
-simultaneous expiry events. Clock advancement without an event does not increment
-the epoch. Backward time and arithmetic overflow are rejected.
-
-Pending deadlines are derived from current atoms rather than a separate timer
-queue, so an overwritten observation cannot leave a stale timer. Already-expired
-VALID arrivals are accepted and immediately explicitly expired at ingestion time,
-using two epochs and one final evaluation; they never publish a valid snapshot.
-At a refresh exactly on an old deadline, advance time first: expiry is processed
-before the replacement observation. Repeated advancement cannot re-emit expiry.
-
-Each reevaluation logs `AssuranceChanged` for changes in status or horizon, and
-`WitnessChanged` for acquisition, replacement or removal of support. Both carry
-old/new values. Initial all-unknown state is the documented epoch-zero baseline.
-The log is an in-memory, deterministic audit history, not durable storage. The
-runtime uses no wall-clock reads, background tasks or real sleeping.
-
-## Acceptance evidence and next boundary
-
-| Week 1 requirement | Automated check |
+| Event | Meaning |
 | --- | --- |
-| C1 sensor loss | `c1_quorum_survives_one_sensor_loss`, including comparison with an all-sensors-required graph rule |
-| C2 expiry without new version | `c2_expiry_without_version_change_is_explicit_and_propagates` |
-| Hand-worked logical cases | AND/OR pair table and all permutations of 2-of-3 status combinations |
-| Witnesses and horizons | Strongest threshold support, alternative ties, shared-leaf diamond, nested horizon tests |
-| Graph validation | Malformed thresholds, IDs, references, duplicate premises, unsupported conclusions and cycles |
-| Event lifecycle | Replacement, simultaneous expiry, late arrivals, rejected updates, restoration and chronological replay |
-| Reproducibility | Reversed graph input order yields identical results and audit entries |
-| Independent action roots | Evidence loss affects only roots whose rules require that evidence |
+| `EvidenceUpdated` | We accepted a new observation. |
+| `EvidenceExpired` | A valid observation reached its deadline. |
+| `AssuranceChanged` | A conclusion's status or support deadline changed. |
+| `WitnessChanged` | The evidence selected to explain a conclusion changed. |
 
-The full evaluator and reverse indexes are ready for Week 2's incremental
-implementation. Exhaustive witness enumeration, randomized full/incremental
-comparison, leases, device dispatch, physical simulation and the Python AI
-planner are intentionally outside the Week 1 gate.
+Each entry includes simulated time and epoch. The history currently lives in
+memory; it is not automatically saved to a database or file.
+
+## 10. How the code fits together
+
+You will usually interact with `AssuranceRuntime`, which coordinates the parts:
+
+| Call | What it does |
+| --- | --- |
+| `AssuranceGraph::new(...)` | Defines and validates the evidence nodes and rules. |
+| `AssuranceRuntime::new(graph)` | Starts an experiment with that graph. |
+| `runtime.update(atom)` | Supplies an observation. |
+| `runtime.advance_to(time)` | Moves simulated time forward and processes expiries. |
+| `runtime.evaluation()` | Shows the current conclusions and their witnesses. |
+| `runtime.audit()` | Shows the history of changes. |
+
+In Week 1, every evidence update or expiry batch triggers a complete graph
+check. That simple implementation is our **full reference evaluator**. Week 2
+will add a more selective evaluator and check that it produces the same answers.
+
+## 11. What our demonstration proves
+
+Run this from the project directory:
+
+```sh
+cargo run --offline --example week_one
+```
+
+It demonstrates two scenarios from the specification:
+
+- **C1 — One sensor becomes unknown:** a 2-of-3 hazard rule stays valid because
+  the other two sensors still provide support. Its witness changes.
+- **C2 — No new message arrives:** version 10 expires at 2 seconds. At 3 seconds
+  it is unknown, while its version remains 10. The expiry is recorded at 2 seconds.
+
+The automated tests also check rule combinations, invalid graphs, deadlines,
+replacement observations, and whether unrelated action roots retain their results.
+Run them with `cargo test --offline`.
+
+These tests check our implementation's behavior. They do not establish that
+real sensors are truthful or that the whole building is physically safe.
+
+## 12. What comes next
+
+Week 2 will independently check witness choices on small graphs, then add
+**incremental evaluation**: revisiting only conclusions that could be affected
+by a change. The full evaluator stays available to check its answers.
+
+Action execution, permission leases, the building simulator and the Python AI
+planner come later in the timeline.
+
+For exact field contracts, selection rules, event ordering, implementation
+assumptions and test mappings, see the [technical reference](week-one-reference.md).
+The reference also records where we made explicit choices because the supplied
+specification did not state every detail. Implementation Specification v1 remains
+the technical authority for this work.
