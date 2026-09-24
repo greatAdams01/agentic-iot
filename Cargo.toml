@@ -1,0 +1,8 @@
+[package]
+name = "dcra"
+version = "0.1.0"
+edition = "2024"
+description = "Minimal reference evaluator for evidence-bound IoT action assurance"
+publish = false
+
+[dependencies]
