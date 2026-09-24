@@ -1,7 +1,10 @@
-//! Milestone one: recompute action permission from current evidence and controlled time.
+//! Week 1: evidence lifecycle, validated assurance DAGs and full reference evaluation.
 //!
 //! This models declared evidence support, not a guarantee of physical safety.
 
-pub mod assurance;
 pub mod clock;
 pub mod evidence;
+
+pub mod evaluator;
+pub mod graph;
+pub mod runtime;

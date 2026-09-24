@@ -2,28 +2,62 @@ use std::time::Duration;
 
 /// Support for a predicate, rather than whether its physical situation is desirable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EvidenceStatus {
+pub enum AssuranceStatus {
     Valid,
     Unknown,
     Invalid,
 }
 
-/// One observation's declared status and validity deadline on the simulation clock.
-/// Evidence identity is its key in the evaluator's evidence map.
-#[derive(Debug, Clone, Copy)]
-pub struct EvidenceRecord {
-    pub status: EvidenceStatus,
-    pub expires_at: Duration,
+/// A VALID value always has a horizon; unsupported values cannot carry one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssuranceValue {
+    Valid { horizon: Duration },
+    Unknown,
+    Invalid,
 }
 
-impl EvidenceRecord {
-    /// Expired VALID evidence becomes effectively UNKNOWN, including at the deadline.
-    /// UNKNOWN and INVALID remain unsupported until replaced by a new record.
-    /// Evaluation does not mutate the stored observation.
-    pub fn status_at(&self, now: Duration) -> EvidenceStatus {
+impl AssuranceValue {
+    pub fn status(self) -> AssuranceStatus {
+        match self {
+            Self::Valid { .. } => AssuranceStatus::Valid,
+            Self::Unknown => AssuranceStatus::Unknown,
+            Self::Invalid => AssuranceStatus::Invalid,
+        }
+    }
+    pub fn horizon(self) -> Option<Duration> {
+        match self {
+            Self::Valid { horizon } => Some(horizon),
+            _ => None,
+        }
+    }
+}
+
+/// Latest observation metadata and its current logical status.
+/// Runtime expiry changes status, but preserves the observation's version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceAtom {
+    pub evidence_id: String,
+    pub evidence_type: String,
+    pub predicate: String,
+    pub source_id: String,
+    pub version: u64,
+    pub observed_at: Duration,
+    pub expires_at: Duration,
+    pub status: AssuranceStatus,
+    pub payload_hash: Option<String>,
+}
+
+impl EvidenceAtom {
+    pub fn value_at(&self, now: Duration) -> AssuranceValue {
+        if self.observed_at > now {
+            return AssuranceValue::Unknown;
+        }
         match self.status {
-            EvidenceStatus::Valid if now >= self.expires_at => EvidenceStatus::Unknown,
-            status => status,
+            AssuranceStatus::Valid if now < self.expires_at => AssuranceValue::Valid {
+                horizon: self.expires_at,
+            },
+            AssuranceStatus::Invalid => AssuranceValue::Invalid,
+            _ => AssuranceValue::Unknown,
         }
     }
 }

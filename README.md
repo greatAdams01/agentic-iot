@@ -1,60 +1,60 @@
 # Dependency-Closed Runtime Assurance
 
-An action's permission should depend on evidence that is still usable when the
-decision is made. For example, a door-closing action requires evidence that the
-room is clear. Once that evidence expires, the action must be blocked.
+This Rust library implements the **Week 1 evidence lifecycle and full reference
+evaluator** from the Agentic IoT Six Week Research Timeline, using Implementation
+Specification v1 sections 4–14, 16 and 32. It models declared evidence support;
+it does not establish sensor truth or physical safety, or dispatch device actions.
 
-This Rust library is **milestone one**, a small reference implementation of that
-rule. It checks declared evidence support; it does not guarantee physical safety
-or control any device. There are no external dependencies.
+A validated dependency graph expresses AND, OR and k-of-n justifications. Each
+valid conclusion has a preferred witness identifying its supporting observations
+and a horizon showing when that support expires. A deterministic runtime accepts
+versioned observations, processes explicit expiry events, and records transitions.
 
-## Run
+## Run and inspect
 
-From this directory, with a Rust toolchain supporting edition 2024:
+With a Rust toolchain supporting edition 2024 (no external dependencies):
 
 ```sh
+cargo run --offline --example week_one
 cargo test --offline
-cargo run --offline --example expiry
 cargo fmt --check
 cargo clippy --offline --all-targets -- -D warnings
 ```
 
-The example allows `close_door` at time zero and blocks it at five seconds, when
-`room_clear` expires. Time advances explicitly; the program never sleeps.
+The `week_one` example demonstrates:
 
-## Current semantics
+- **C1:** a 2-of-3 hazard quorum stays valid after one sensor becomes unknown,
+  with the supporting witness changing to the remaining two sensors.
+- **C2:** evidence version 10 expires at simulated time 2 without a new sensor
+  message. At time 3 its status is unknown, its version is still 10, and the
+  explicit expiry event is recorded at time 2.
 
-- Each evidence record has a declared VALID, UNKNOWN, or INVALID status and an
-  absolute expiry deadline measured from the simulation clock's zero.
-- VALID evidence is usable only while `now < expires_at`. At and after expiry,
-  its effective status is UNKNOWN. The stored observation is not mutated.
-- UNKNOWN and INVALID remain unsupported until replaced with new evidence.
-- Every evidence item listed in an action contract must currently be VALID.
-- Missing evidence blocks the action. Empty contracts also block, preventing
-  accidental unconditional permission in this milestone.
-- Every call recomputes all contracts and returns reasons for blocked actions.
-  Decisions are snapshots, not durable execution permissions. Advancing the clock
-  does not run an evaluator in the background: call `evaluate_all` again.
-- There are no derived evidence nodes yet; requirements refer directly to records.
+Read [schema and semantic notes](docs/week-one.md) for the type contracts,
+three-valued truth tables, assumptions, tie-breaking, event ordering, and
+acceptance-test mapping. See `examples/week_one.rs` for the public API usage.
 
-## Layout
+## Implementation
 
-| Path | Responsibility |
+| Module | Responsibility |
 | --- | --- |
-| `src/clock.rs` | Controlled monotonic simulation time |
-| `src/evidence.rs` | Evidence status and expiry semantics |
-| `src/assurance.rs` | Action contracts, decisions, and full recomputation |
-| `tests/milestone_one.rs` | Validity, expiry boundary, blocking, and locality checks |
-| `examples/expiry.rs` | Runnable permission-before-and-after-expiry example |
+| `evidence` | Three-valued status, assurance values, complete evidence metadata |
+| `graph` | Validated immutable DAG, topological order, premise/conclusion indexes |
+| `evaluator` | Full evaluation of every rule and node, preferred witnesses and horizons |
+| `runtime` | Versioned updates, epochs, controlled time, expiry and audit history |
+| `clock` | Monotonic virtual clock; no real sleeping or wall-clock decisions |
 
-## Later milestones
+Use `AssuranceRuntime` for evidence updates and expiry processing. `AssuranceStatus`
+is the single status enum used by evidence and derived assurance values.
+The full evaluator remains the reference for verifying incremental evaluation.
 
-1. Derived evidence, threshold rules, alternative witnesses, and support horizons.
-2. Incremental evaluation checked against a full reference evaluator.
-3. Evidence versions, assurance leases, and start/run/commit/outcome contracts.
-4. A discrete-event building simulator, baseline policies, and fault experiments.
-5. Distributed communication, an independently constrained AI planner, and
-   eventually hardware adapters.
+## Week 1 completion gate
 
-Those mechanisms are intentionally not implemented here. First understand and
-validate this small rule before extending it.
+`tests/week_one.rs` verifies hand-worked truth tables and horizons, C1/C2,
+malformed graph rejection, nested support, deterministic ties and replay,
+explicit expiry at the deadline, simultaneous expiries, replacement observations,
+and atomic rejection of malformed or stale updates. No test uses real sleeping.
+
+Week 2 adds a tiny-graph exhaustive witness oracle and incremental evaluation
+checked against this full evaluator. Leases, action execution, the building
+simulator and AI integration remain later work. The agreed language split remains
+Rust for the runtime and Python for the later planner adapter and analysis.
